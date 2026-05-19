@@ -31,7 +31,13 @@
  *   messages: Array<{ lifecycle: string, phase: string | null, text: string }>,
  *   fileChanges: ThreadItem[],
  *   commandExecutions: ThreadItem[],
- *   onProgress: ProgressReporter | null
+ *   onProgress: ProgressReporter | null,
+ *   startedAt: number,
+ *   lastActivityAt: number,
+ *   watchdogTimer: ReturnType<typeof setInterval> | null,
+ *   rejected: boolean,
+ *   idleTimeoutMs: number,
+ *   hardTimeoutMs: number
  * }} TurnCaptureState
  */
 import { readJsonFile } from "./fs.mjs";
@@ -43,6 +49,24 @@ const SERVICE_NAME = "claude_code_codex_plugin";
 const TASK_THREAD_PREFIX = "Codex Companion Task";
 const DEFAULT_CONTINUE_PROMPT =
   "Continue from the current thread state. Pick the next highest-value step and follow through until the task is resolved.";
+
+const DEFAULT_TURN_IDLE_TIMEOUT_MS = 300_000;
+const DEFAULT_TURN_HARD_TIMEOUT_MS = 900_000;
+const TURN_WATCHDOG_TICK_MS = 5_000;
+
+function resolveTimeoutMs(explicit, envName, defaultMs) {
+  if (Number.isFinite(explicit) && explicit >= 0) {
+    return explicit;
+  }
+  const raw = process.env[envName];
+  if (raw !== undefined && raw !== "") {
+    const parsed = Number(raw);
+    if (Number.isFinite(parsed) && parsed >= 0) {
+      return parsed;
+    }
+  }
+  return defaultMs;
+}
 
 function cleanCodexStderr(stderr) {
   return stderr
@@ -302,6 +326,7 @@ function createTurnCaptureState(threadId, options = {}) {
     rejectCompletion = reject;
   });
 
+  const now = Date.now();
   return {
     threadId,
     rootThreadId: threadId,
@@ -326,7 +351,13 @@ function createTurnCaptureState(threadId, options = {}) {
     messages: [],
     fileChanges: [],
     commandExecutions: [],
-    onProgress: options.onProgress ?? null
+    onProgress: options.onProgress ?? null,
+    startedAt: now,
+    lastActivityAt: now,
+    watchdogTimer: null,
+    rejected: false,
+    idleTimeoutMs: resolveTimeoutMs(options.idleTimeoutMs, "CODEX_COMPANION_TURN_IDLE_TIMEOUT_MS", DEFAULT_TURN_IDLE_TIMEOUT_MS),
+    hardTimeoutMs: resolveTimeoutMs(options.hardTimeoutMs, "CODEX_COMPANION_TURN_HARD_TIMEOUT_MS", DEFAULT_TURN_HARD_TIMEOUT_MS)
   };
 }
 
@@ -334,6 +365,13 @@ function clearCompletionTimer(state) {
   if (state.completionTimer) {
     clearTimeout(state.completionTimer);
     state.completionTimer = null;
+  }
+}
+
+function clearWatchdog(state) {
+  if (state.watchdogTimer) {
+    clearInterval(state.watchdogTimer);
+    state.watchdogTimer = null;
   }
 }
 
@@ -555,6 +593,8 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
   const previousHandler = client.notificationHandler;
 
   client.setNotificationHandler((message) => {
+    state.lastActivityAt = Date.now();
+
     if (!state.turnId) {
       state.bufferedNotifications.push(message);
       return;
@@ -575,8 +615,48 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
     applyTurnNotification(state, message);
   });
 
+  if (state.idleTimeoutMs > 0 || state.hardTimeoutMs > 0) {
+    state.watchdogTimer = setInterval(() => {
+      if (state.rejected || state.completed) {
+        return;
+      }
+      const now = Date.now();
+      const idleBreach = state.idleTimeoutMs > 0 && now - state.lastActivityAt > state.idleTimeoutMs;
+      const hardBreach = state.hardTimeoutMs > 0 && now - state.startedAt > state.hardTimeoutMs;
+      if (!idleBreach && !hardBreach) {
+        return;
+      }
+
+      state.rejected = true;
+      clearWatchdog(state);
+
+      const message = idleBreach
+        ? `Codex turn idle for >${state.idleTimeoutMs}ms; aborting`
+        : `Codex turn exceeded hard timeout of ${state.hardTimeoutMs}ms; aborting`;
+      emitProgress(state.onProgress, message, "failed");
+
+      if (state.turnId) {
+        client
+          .request("turn/interrupt", { threadId: state.threadId, turnId: state.turnId })
+          .catch(() => {});
+      }
+      state.rejectCompletion(new Error(message));
+    }, TURN_WATCHDOG_TICK_MS);
+    state.watchdogTimer.unref?.();
+  }
+
   try {
-    const response = await startRequest();
+    const response = await Promise.race([
+      startRequest(),
+      state.completion.then(
+        () => {
+          throw new Error("turn aborted before turn/start replied");
+        },
+        (err) => {
+          throw err;
+        }
+      )
+    ]);
     options.onResponse?.(response, state);
     state.turnId = response.turn?.id ?? null;
     if (state.turnId) {
@@ -600,6 +680,7 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
     return await state.completion;
   } finally {
     clearCompletionTimer(state);
+    clearWatchdog(state);
     client.setNotificationHandler(previousHandler ?? null);
   }
 }
@@ -936,6 +1017,8 @@ export async function runAppServerReview(cwd, options = {}) {
         }),
       {
         onProgress: options.onProgress,
+        idleTimeoutMs: options.idleTimeoutMs,
+        hardTimeoutMs: options.hardTimeoutMs,
         onResponse(response, state) {
           if (response.reviewThreadId) {
             state.threadIds.add(response.reviewThreadId);
@@ -1009,7 +1092,11 @@ export async function runAppServerTurn(cwd, options = {}) {
           effort: options.effort ?? null,
           outputSchema: options.outputSchema ?? null
         }),
-      { onProgress: options.onProgress }
+      {
+        onProgress: options.onProgress,
+        idleTimeoutMs: options.idleTimeoutMs,
+        hardTimeoutMs: options.hardTimeoutMs
+      }
     );
 
     return {
