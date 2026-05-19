@@ -10,15 +10,6 @@ import { BROKER_BUSY_RPC_CODE, CodexAppServerClient } from "./lib/app-server.mjs
 import { parseBrokerEndpoint } from "./lib/broker-endpoint.mjs";
 
 const STREAMING_METHODS = new Set(["turn/start", "review/start", "thread/compact/start"]);
-const BROKER_STREAMING_REQUEST_TIMEOUT_MS = 60 * 60 * 1000;
-
-class BrokerStreamingRequestTimeout extends Error {
-  constructor() {
-    super("Broker streaming request timed out");
-    this.name = "BrokerStreamingRequestTimeout";
-    this.rpcCode = -32000;
-  }
-}
 
 function buildStreamThreadIds(method, params, result) {
   const threadIds = new Set();
@@ -27,25 +18,6 @@ function buildStreamThreadIds(method, params, result) {
   }
   if (method === "review/start" && result?.reviewThreadId) {
     threadIds.add(result.reviewThreadId);
-  }
-  return threadIds;
-}
-
-function buildOrphanThreadIds(method, params, result) {
-  // Subset of buildStreamThreadIds used when quarantining an abandoned
-  // turn: for detached review the source thread is intentionally shared
-  // with future turns, so quarantining it would silently drop later
-  // legitimate notifications.
-  const threadIds = new Set();
-  if (method === "review/start") {
-    if (result?.reviewThreadId) {
-      threadIds.add(result.reviewThreadId);
-    }
-    if (params?.delivery !== "detached" && params?.threadId) {
-      threadIds.add(params.threadId);
-    }
-  } else if (params?.threadId) {
-    threadIds.add(params.threadId);
   }
   return threadIds;
 }
@@ -97,91 +69,19 @@ async function main() {
   let activeRequestSocket = null;
   let activeStreamSocket = null;
   let activeStreamThreadIds = null;
-  let activeStreamTurnId = null;
   const sockets = new Set();
-  const orphanedThreadIds = new Set();
 
   function clearSocketOwnership(socket) {
-    // Intentionally don't null activeRequestSocket here. If this socket
-    // has an in-flight streaming request, clearing ownership before the
-    // forwarded appClient.request resolves opens a window where a new
-    // client can claim the broker and receive the orphan's notifications.
-    // The request handler clears activeRequestSocket itself once the
-    // await settles (success or error), with orphan-handling for dead
-    // sockets in the streaming branch.
+    if (activeRequestSocket === socket) {
+      activeRequestSocket = null;
+    }
     if (activeStreamSocket === socket) {
-      // Streaming client died with an active turn. Quarantine its thread
-      // ids so subsequent notifications don't leak to the next client,
-      // and best-effort interrupt the underlying turn so the app-server
-      // settles instead of running unbounded work for a vanished caller.
-      // (Note: this list was built by buildStreamThreadIds, which for a
-      // healthy claimed stream is the right scope; detached-review
-      // narrowing only applies to the in-flight orphan path below.)
-      if (activeStreamThreadIds) {
-        for (const tid of activeStreamThreadIds) {
-          orphanedThreadIds.add(tid);
-          if (activeStreamTurnId) {
-            appClient
-              .request("turn/interrupt", { threadId: tid, turnId: activeStreamTurnId })
-              .catch(() => {});
-          }
-        }
-      }
       activeStreamSocket = null;
       activeStreamThreadIds = null;
-      activeStreamTurnId = null;
     }
   }
 
   function routeNotification(message) {
-    const messageThreadId = message.params?.threadId ?? null;
-    const carriedThreadId = message.params?.thread?.id ?? null;
-    // While a stream is active, observe newly spawned subagent threads
-    // and any collaboration receiver ids so they're already in
-    // activeStreamThreadIds when ownership is later cleared. Without
-    // this, only the root/review ids from buildStreamThreadIds would
-    // be quarantined and subagent notifications would leak.
-    if (activeStreamSocket && activeStreamThreadIds) {
-      if (
-        message.method === "thread/started" &&
-        carriedThreadId &&
-        !activeStreamThreadIds.has(carriedThreadId)
-      ) {
-        activeStreamThreadIds.add(carriedThreadId);
-      }
-      const item = message.params?.item;
-      if (item?.type === "collabAgentToolCall" && Array.isArray(item.receiverThreadIds)) {
-        for (const rt of item.receiverThreadIds) {
-          if (rt && !activeStreamThreadIds.has(rt)) {
-            activeStreamThreadIds.add(rt);
-          }
-        }
-      }
-    }
-    if (
-      (messageThreadId && orphanedThreadIds.has(messageThreadId)) ||
-      (carriedThreadId && orphanedThreadIds.has(carriedThreadId))
-    ) {
-      // Propagate quarantine: subagent threads spawned by an orphan
-      // surface via collabAgentToolCall.receiverThreadIds (carried on
-      // item/started or item/completed) and via thread/started messages
-      // whose params.thread.id is the new subagent thread.
-      const item = message.params?.item;
-      if (item?.type === "collabAgentToolCall" && Array.isArray(item.receiverThreadIds)) {
-        for (const rt of item.receiverThreadIds) {
-          if (rt) {
-            orphanedThreadIds.add(rt);
-          }
-        }
-      }
-      if (message.method === "thread/started" && carriedThreadId) {
-        orphanedThreadIds.add(carriedThreadId);
-      }
-      if (message.method === "turn/completed" && messageThreadId) {
-        orphanedThreadIds.delete(messageThreadId);
-      }
-      return;
-    }
     const target = activeRequestSocket ?? activeStreamSocket;
     if (!target) {
       return;
@@ -192,7 +92,6 @@ async function main() {
       if (!threadId || !activeStreamThreadIds || activeStreamThreadIds.has(threadId)) {
         activeStreamSocket = null;
         activeStreamThreadIds = null;
-        activeStreamTurnId = null;
         if (activeRequestSocket === target) {
           activeRequestSocket = null;
         }
@@ -299,57 +198,11 @@ async function main() {
         activeRequestSocket = socket;
 
         try {
-          let result;
-          if (isStreaming) {
-            let timeoutTimer = null;
-            const requestPromise = appClient.request(message.method, message.params ?? {});
-            try {
-              result = await Promise.race([
-                requestPromise,
-                new Promise((_, reject) => {
-                  timeoutTimer = setTimeout(
-                    () => reject(new BrokerStreamingRequestTimeout()),
-                    BROKER_STREAMING_REQUEST_TIMEOUT_MS
-                  );
-                  timeoutTimer.unref?.();
-                })
-              ]);
-            } finally {
-              if (timeoutTimer) {
-                clearTimeout(timeoutTimer);
-              }
-            }
-          } else {
-            result = await appClient.request(message.method, message.params ?? {});
-          }
+          const result = await appClient.request(message.method, message.params ?? {});
           send(socket, { id: message.id, result });
           if (isStreaming) {
-            if (socket.destroyed) {
-              // Client disconnected during the forwarded request. Don't
-              // claim stream ownership for a dead socket (it would wedge
-              // other clients until completion). If the returned turn is
-              // already terminal we don't need to do anything else; the
-              // app-server has settled and there's nothing to quarantine.
-              const turnAlreadyComplete =
-                Boolean(result?.turn?.status) && result.turn.status !== "inProgress";
-              if (!turnAlreadyComplete) {
-                const orphanThreadIds = buildOrphanThreadIds(message.method, message.params ?? {}, result);
-                for (const tid of orphanThreadIds) {
-                  orphanedThreadIds.add(tid);
-                }
-                if (result?.turn?.id) {
-                  for (const tid of orphanThreadIds) {
-                    appClient
-                      .request("turn/interrupt", { threadId: tid, turnId: result.turn.id })
-                      .catch(() => {});
-                  }
-                }
-              }
-            } else {
-              activeStreamSocket = socket;
-              activeStreamThreadIds = buildStreamThreadIds(message.method, message.params ?? {}, result);
-              activeStreamTurnId = result?.turn?.id ?? null;
-            }
+            activeStreamSocket = socket;
+            activeStreamThreadIds = buildStreamThreadIds(message.method, message.params ?? {}, result);
           }
           if (activeRequestSocket === socket) {
             activeRequestSocket = null;
