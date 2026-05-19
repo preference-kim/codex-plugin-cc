@@ -50,9 +50,10 @@ const TASK_THREAD_PREFIX = "Codex Companion Task";
 const DEFAULT_CONTINUE_PROMPT =
   "Continue from the current thread state. Pick the next highest-value step and follow through until the task is resolved.";
 
-const DEFAULT_TURN_IDLE_TIMEOUT_MS = 300_000;
-const DEFAULT_TURN_HARD_TIMEOUT_MS = 900_000;
+const DEFAULT_TURN_IDLE_TIMEOUT_MS = 600_000;
+const DEFAULT_TURN_HARD_TIMEOUT_MS = 1_800_000;
 const TURN_WATCHDOG_TICK_MS = 5_000;
+const TURN_INTERRUPT_ACK_MS = 2_000;
 
 function resolveTimeoutMs(explicit, envName, defaultMs) {
   if (Number.isFinite(explicit) && explicit >= 0) {
@@ -649,12 +650,17 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
           }
         }
       }
+      const finishReject = () => state.rejectCompletion(new Error(message));
       if (interruptTurnId) {
-        client
-          .request("turn/interrupt", { threadId: state.threadId, turnId: interruptTurnId })
-          .catch(() => {});
+        Promise.race([
+          client.request("turn/interrupt", { threadId: state.threadId, turnId: interruptTurnId }),
+          new Promise((resolve) => setTimeout(resolve, TURN_INTERRUPT_ACK_MS))
+        ])
+          .catch(() => {})
+          .finally(finishReject);
+      } else {
+        finishReject();
       }
-      state.rejectCompletion(new Error(message));
     }, TURN_WATCHDOG_TICK_MS);
     state.watchdogTimer.unref?.();
   }
