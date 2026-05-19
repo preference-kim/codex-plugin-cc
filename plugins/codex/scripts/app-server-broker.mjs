@@ -22,6 +22,25 @@ function buildStreamThreadIds(method, params, result) {
   return threadIds;
 }
 
+function buildOrphanThreadIds(method, params, result) {
+  // Subset of buildStreamThreadIds used when quarantining an abandoned
+  // turn: for detached review the source thread is intentionally shared
+  // with future turns, so quarantining it would silently drop later
+  // legitimate notifications.
+  const threadIds = new Set();
+  if (method === "review/start") {
+    if (result?.reviewThreadId) {
+      threadIds.add(result.reviewThreadId);
+    }
+    if (params?.delivery !== "detached" && params?.threadId) {
+      threadIds.add(params.threadId);
+    }
+  } else if (params?.threadId) {
+    threadIds.add(params.threadId);
+  }
+  return threadIds;
+}
+
 function buildJsonRpcError(code, message, data) {
   return data === undefined ? { code, message } : { code, message, data };
 }
@@ -74,14 +93,21 @@ async function main() {
   const orphanedThreadIds = new Set();
 
   function clearSocketOwnership(socket) {
-    if (activeRequestSocket === socket) {
-      activeRequestSocket = null;
-    }
+    // Intentionally don't null activeRequestSocket here. If this socket
+    // has an in-flight streaming request, clearing ownership before the
+    // forwarded appClient.request resolves opens a window where a new
+    // client can claim the broker and receive the orphan's notifications.
+    // The request handler clears activeRequestSocket itself once the
+    // await settles (success or error), with orphan-handling for dead
+    // sockets in the streaming branch.
     if (activeStreamSocket === socket) {
       // Streaming client died with an active turn. Quarantine its thread
       // ids so subsequent notifications don't leak to the next client,
       // and best-effort interrupt the underlying turn so the app-server
       // settles instead of running unbounded work for a vanished caller.
+      // (Note: this list was built by buildStreamThreadIds, which for a
+      // healthy claimed stream is the right scope; detached-review
+      // narrowing only applies to the in-flight orphan path below.)
       if (activeStreamThreadIds) {
         for (const tid of activeStreamThreadIds) {
           orphanedThreadIds.add(tid);
@@ -100,8 +126,27 @@ async function main() {
 
   function routeNotification(message) {
     const messageThreadId = message.params?.threadId ?? null;
-    if (messageThreadId && orphanedThreadIds.has(messageThreadId)) {
-      if (message.method === "turn/completed") {
+    const carriedThreadId = message.params?.thread?.id ?? null;
+    if (
+      (messageThreadId && orphanedThreadIds.has(messageThreadId)) ||
+      (carriedThreadId && orphanedThreadIds.has(carriedThreadId))
+    ) {
+      // Propagate quarantine: subagent threads spawned by an orphan
+      // surface via collabAgentToolCall.receiverThreadIds (carried on
+      // item/started or item/completed) and via thread/started messages
+      // whose params.thread.id is the new subagent thread.
+      const item = message.params?.item;
+      if (item?.type === "collabAgentToolCall" && Array.isArray(item.receiverThreadIds)) {
+        for (const rt of item.receiverThreadIds) {
+          if (rt) {
+            orphanedThreadIds.add(rt);
+          }
+        }
+      }
+      if (message.method === "thread/started" && carriedThreadId) {
+        orphanedThreadIds.add(carriedThreadId);
+      }
+      if (message.method === "turn/completed" && messageThreadId) {
         orphanedThreadIds.delete(messageThreadId);
       }
       return;
@@ -233,7 +278,7 @@ async function main() {
               // thread ids so their notifications are dropped (not
               // forwarded to the next client) and best-effort interrupt
               // the orphaned turn so the app-server frees up.
-              const orphanThreadIds = buildStreamThreadIds(message.method, message.params ?? {}, result);
+              const orphanThreadIds = buildOrphanThreadIds(message.method, message.params ?? {}, result);
               for (const tid of orphanThreadIds) {
                 orphanedThreadIds.add(tid);
               }
