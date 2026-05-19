@@ -50,9 +50,10 @@ const TASK_THREAD_PREFIX = "Codex Companion Task";
 const DEFAULT_CONTINUE_PROMPT =
   "Continue from the current thread state. Pick the next highest-value step and follow through until the task is resolved.";
 
-const DEFAULT_TURN_IDLE_TIMEOUT_MS = 300_000;
-const DEFAULT_TURN_HARD_TIMEOUT_MS = 900_000;
+const DEFAULT_TURN_IDLE_TIMEOUT_MS = 600_000;
+const DEFAULT_TURN_HARD_TIMEOUT_MS = 1_800_000;
 const TURN_WATCHDOG_TICK_MS = 5_000;
+const TURN_INTERRUPT_ACK_MS = 2_000;
 
 function resolveTimeoutMs(explicit, envName, defaultMs) {
   if (Number.isFinite(explicit) && explicit >= 0) {
@@ -376,7 +377,7 @@ function clearWatchdog(state) {
 }
 
 function completeTurn(state, turn = null, options = {}) {
-  if (state.completed) {
+  if (state.completed || state.rejected) {
     return;
   }
 
@@ -593,14 +594,14 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
   const previousHandler = client.notificationHandler;
 
   client.setNotificationHandler((message) => {
-    state.lastActivityAt = Date.now();
-
     if (!state.turnId) {
+      state.lastActivityAt = Date.now();
       state.bufferedNotifications.push(message);
       return;
     }
 
     if (message.method === "thread/started" || message.method === "thread/name/updated") {
+      state.lastActivityAt = Date.now();
       applyTurnNotification(state, message);
       return;
     }
@@ -612,6 +613,7 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
         return;
     }
 
+    state.lastActivityAt = Date.now();
     applyTurnNotification(state, message);
   });
 
@@ -635,12 +637,40 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
         : `Codex turn exceeded hard timeout of ${state.hardTimeoutMs}ms; aborting`;
       emitProgress(state.onProgress, message, "failed");
 
-      if (state.turnId) {
-        client
-          .request("turn/interrupt", { threadId: state.threadId, turnId: state.turnId })
-          .catch(() => {});
+      let interruptTurnId = state.turnId;
+      if (!interruptTurnId) {
+        for (const buffered of state.bufferedNotifications) {
+          if (
+            buffered.method === "turn/started" &&
+            (buffered.params?.threadId ?? null) === state.threadId &&
+            buffered.params?.turn?.id
+          ) {
+            interruptTurnId = buffered.params.turn.id;
+            break;
+          }
+        }
       }
-      state.rejectCompletion(new Error(message));
+      const finishReject = () => state.rejectCompletion(new Error(message));
+      if (interruptTurnId) {
+        let ackTimer = null;
+        const ackTimeout = new Promise((resolve) => {
+          ackTimer = setTimeout(resolve, TURN_INTERRUPT_ACK_MS);
+          ackTimer.unref?.();
+        });
+        Promise.race([
+          client.request("turn/interrupt", { threadId: state.threadId, turnId: interruptTurnId }),
+          ackTimeout
+        ])
+          .catch(() => {})
+          .finally(() => {
+            if (ackTimer) {
+              clearTimeout(ackTimer);
+            }
+            finishReject();
+          });
+      } else {
+        finishReject();
+      }
     }, TURN_WATCHDOG_TICK_MS);
     state.watchdogTimer.unref?.();
   }
@@ -657,6 +687,7 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
         }
       )
     ]);
+    state.lastActivityAt = Date.now();
     options.onResponse?.(response, state);
     state.turnId = response.turn?.id ?? null;
     if (state.turnId) {
