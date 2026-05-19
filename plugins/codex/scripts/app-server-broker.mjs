@@ -69,6 +69,7 @@ async function main() {
   let activeRequestSocket = null;
   let activeStreamSocket = null;
   let activeStreamThreadIds = null;
+  let activeStreamTurnId = null;
   const sockets = new Set();
   const orphanedThreadIds = new Set();
 
@@ -77,8 +78,23 @@ async function main() {
       activeRequestSocket = null;
     }
     if (activeStreamSocket === socket) {
+      // Streaming client died with an active turn. Quarantine its thread
+      // ids so subsequent notifications don't leak to the next client,
+      // and best-effort interrupt the underlying turn so the app-server
+      // settles instead of running unbounded work for a vanished caller.
+      if (activeStreamThreadIds) {
+        for (const tid of activeStreamThreadIds) {
+          orphanedThreadIds.add(tid);
+          if (activeStreamTurnId) {
+            appClient
+              .request("turn/interrupt", { threadId: tid, turnId: activeStreamTurnId })
+              .catch(() => {});
+          }
+        }
+      }
       activeStreamSocket = null;
       activeStreamThreadIds = null;
+      activeStreamTurnId = null;
     }
   }
 
@@ -100,6 +116,7 @@ async function main() {
       if (!threadId || !activeStreamThreadIds || activeStreamThreadIds.has(threadId)) {
         activeStreamSocket = null;
         activeStreamThreadIds = null;
+        activeStreamTurnId = null;
         if (activeRequestSocket === target) {
           activeRequestSocket = null;
         }
@@ -230,6 +247,7 @@ async function main() {
             } else {
               activeStreamSocket = socket;
               activeStreamThreadIds = buildStreamThreadIds(message.method, message.params ?? {}, result);
+              activeStreamTurnId = result?.turn?.id ?? null;
             }
           }
           if (activeRequestSocket === socket) {
