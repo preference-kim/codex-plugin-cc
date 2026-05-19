@@ -10,6 +10,15 @@ import { BROKER_BUSY_RPC_CODE, CodexAppServerClient } from "./lib/app-server.mjs
 import { parseBrokerEndpoint } from "./lib/broker-endpoint.mjs";
 
 const STREAMING_METHODS = new Set(["turn/start", "review/start", "thread/compact/start"]);
+const BROKER_STREAMING_REQUEST_TIMEOUT_MS = 60 * 60 * 1000;
+
+class BrokerStreamingRequestTimeout extends Error {
+  constructor() {
+    super("Broker streaming request timed out");
+    this.name = "BrokerStreamingRequestTimeout";
+    this.rpcCode = -32000;
+  }
+}
 
 function buildStreamThreadIds(method, params, result) {
   const threadIds = new Set();
@@ -127,6 +136,28 @@ async function main() {
   function routeNotification(message) {
     const messageThreadId = message.params?.threadId ?? null;
     const carriedThreadId = message.params?.thread?.id ?? null;
+    // While a stream is active, observe newly spawned subagent threads
+    // and any collaboration receiver ids so they're already in
+    // activeStreamThreadIds when ownership is later cleared. Without
+    // this, only the root/review ids from buildStreamThreadIds would
+    // be quarantined and subagent notifications would leak.
+    if (activeStreamSocket && activeStreamThreadIds) {
+      if (
+        message.method === "thread/started" &&
+        carriedThreadId &&
+        !activeStreamThreadIds.has(carriedThreadId)
+      ) {
+        activeStreamThreadIds.add(carriedThreadId);
+      }
+      const item = message.params?.item;
+      if (item?.type === "collabAgentToolCall" && Array.isArray(item.receiverThreadIds)) {
+        for (const rt of item.receiverThreadIds) {
+          if (rt && !activeStreamThreadIds.has(rt)) {
+            activeStreamThreadIds.add(rt);
+          }
+        }
+      }
+    }
     if (
       (messageThreadId && orphanedThreadIds.has(messageThreadId)) ||
       (carriedThreadId && orphanedThreadIds.has(carriedThreadId))
@@ -268,25 +299,50 @@ async function main() {
         activeRequestSocket = socket;
 
         try {
-          const result = await appClient.request(message.method, message.params ?? {});
+          let result;
+          if (isStreaming) {
+            let timeoutTimer = null;
+            const requestPromise = appClient.request(message.method, message.params ?? {});
+            try {
+              result = await Promise.race([
+                requestPromise,
+                new Promise((_, reject) => {
+                  timeoutTimer = setTimeout(
+                    () => reject(new BrokerStreamingRequestTimeout()),
+                    BROKER_STREAMING_REQUEST_TIMEOUT_MS
+                  );
+                  timeoutTimer.unref?.();
+                })
+              ]);
+            } finally {
+              if (timeoutTimer) {
+                clearTimeout(timeoutTimer);
+              }
+            }
+          } else {
+            result = await appClient.request(message.method, message.params ?? {});
+          }
           send(socket, { id: message.id, result });
           if (isStreaming) {
             if (socket.destroyed) {
               // Client disconnected during the forwarded request. Don't
               // claim stream ownership for a dead socket (it would wedge
-              // other clients until completion); quarantine the orphan
-              // thread ids so their notifications are dropped (not
-              // forwarded to the next client) and best-effort interrupt
-              // the orphaned turn so the app-server frees up.
-              const orphanThreadIds = buildOrphanThreadIds(message.method, message.params ?? {}, result);
-              for (const tid of orphanThreadIds) {
-                orphanedThreadIds.add(tid);
-              }
-              if (result?.turn?.id) {
+              // other clients until completion). If the returned turn is
+              // already terminal we don't need to do anything else; the
+              // app-server has settled and there's nothing to quarantine.
+              const turnAlreadyComplete =
+                Boolean(result?.turn?.status) && result.turn.status !== "inProgress";
+              if (!turnAlreadyComplete) {
+                const orphanThreadIds = buildOrphanThreadIds(message.method, message.params ?? {}, result);
                 for (const tid of orphanThreadIds) {
-                  appClient
-                    .request("turn/interrupt", { threadId: tid, turnId: result.turn.id })
-                    .catch(() => {});
+                  orphanedThreadIds.add(tid);
+                }
+                if (result?.turn?.id) {
+                  for (const tid of orphanThreadIds) {
+                    appClient
+                      .request("turn/interrupt", { threadId: tid, turnId: result.turn.id })
+                      .catch(() => {});
+                  }
                 }
               }
             } else {
