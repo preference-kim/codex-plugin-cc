@@ -377,7 +377,7 @@ function clearWatchdog(state) {
 }
 
 function completeTurn(state, turn = null, options = {}) {
-  if (state.completed) {
+  if (state.completed || state.rejected) {
     return;
   }
 
@@ -652,12 +652,22 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
       }
       const finishReject = () => state.rejectCompletion(new Error(message));
       if (interruptTurnId) {
+        let ackTimer = null;
+        const ackTimeout = new Promise((resolve) => {
+          ackTimer = setTimeout(resolve, TURN_INTERRUPT_ACK_MS);
+          ackTimer.unref?.();
+        });
         Promise.race([
           client.request("turn/interrupt", { threadId: state.threadId, turnId: interruptTurnId }),
-          new Promise((resolve) => setTimeout(resolve, TURN_INTERRUPT_ACK_MS))
+          ackTimeout
         ])
           .catch(() => {})
-          .finally(finishReject);
+          .finally(() => {
+            if (ackTimer) {
+              clearTimeout(ackTimer);
+            }
+            finishReject();
+          });
       } else {
         finishReject();
       }
