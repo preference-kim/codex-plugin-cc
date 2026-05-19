@@ -201,8 +201,23 @@ async function main() {
           const result = await appClient.request(message.method, message.params ?? {});
           send(socket, { id: message.id, result });
           if (isStreaming) {
-            activeStreamSocket = socket;
-            activeStreamThreadIds = buildStreamThreadIds(message.method, message.params ?? {}, result);
+            if (socket.destroyed) {
+              // Client disconnected during the forwarded request. Don't
+              // claim stream ownership for a dead socket (it would wedge
+              // other clients until completion); best-effort interrupt
+              // the orphaned turn so the app-server frees up.
+              if (result?.turn?.id) {
+                const orphanedThreadIds = buildStreamThreadIds(message.method, message.params ?? {}, result);
+                for (const tid of orphanedThreadIds) {
+                  appClient
+                    .request("turn/interrupt", { threadId: tid, turnId: result.turn.id })
+                    .catch(() => {});
+                }
+              }
+            } else {
+              activeStreamSocket = socket;
+              activeStreamThreadIds = buildStreamThreadIds(message.method, message.params ?? {}, result);
+            }
           }
           if (activeRequestSocket === socket) {
             activeRequestSocket = null;
