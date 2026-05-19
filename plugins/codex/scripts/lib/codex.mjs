@@ -593,14 +593,14 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
   const previousHandler = client.notificationHandler;
 
   client.setNotificationHandler((message) => {
-    state.lastActivityAt = Date.now();
-
     if (!state.turnId) {
+      state.lastActivityAt = Date.now();
       state.bufferedNotifications.push(message);
       return;
     }
 
     if (message.method === "thread/started" || message.method === "thread/name/updated") {
+      state.lastActivityAt = Date.now();
       applyTurnNotification(state, message);
       return;
     }
@@ -612,6 +612,7 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
         return;
     }
 
+    state.lastActivityAt = Date.now();
     applyTurnNotification(state, message);
   });
 
@@ -635,9 +636,22 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
         : `Codex turn exceeded hard timeout of ${state.hardTimeoutMs}ms; aborting`;
       emitProgress(state.onProgress, message, "failed");
 
-      if (state.turnId) {
+      let interruptTurnId = state.turnId;
+      if (!interruptTurnId) {
+        for (const buffered of state.bufferedNotifications) {
+          if (
+            buffered.method === "turn/started" &&
+            (buffered.params?.threadId ?? null) === state.threadId &&
+            buffered.params?.turn?.id
+          ) {
+            interruptTurnId = buffered.params.turn.id;
+            break;
+          }
+        }
+      }
+      if (interruptTurnId) {
         client
-          .request("turn/interrupt", { threadId: state.threadId, turnId: state.turnId })
+          .request("turn/interrupt", { threadId: state.threadId, turnId: interruptTurnId })
           .catch(() => {});
       }
       state.rejectCompletion(new Error(message));
@@ -657,6 +671,7 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
         }
       )
     ]);
+    state.lastActivityAt = Date.now();
     options.onResponse?.(response, state);
     state.turnId = response.turn?.id ?? null;
     if (state.turnId) {
