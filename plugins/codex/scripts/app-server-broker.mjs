@@ -70,6 +70,7 @@ async function main() {
   let activeStreamSocket = null;
   let activeStreamThreadIds = null;
   const sockets = new Set();
+  const orphanedThreadIds = new Set();
 
   function clearSocketOwnership(socket) {
     if (activeRequestSocket === socket) {
@@ -82,6 +83,13 @@ async function main() {
   }
 
   function routeNotification(message) {
+    const messageThreadId = message.params?.threadId ?? null;
+    if (messageThreadId && orphanedThreadIds.has(messageThreadId)) {
+      if (message.method === "turn/completed") {
+        orphanedThreadIds.delete(messageThreadId);
+      }
+      return;
+    }
     const target = activeRequestSocket ?? activeStreamSocket;
     if (!target) {
       return;
@@ -204,11 +212,16 @@ async function main() {
             if (socket.destroyed) {
               // Client disconnected during the forwarded request. Don't
               // claim stream ownership for a dead socket (it would wedge
-              // other clients until completion); best-effort interrupt
+              // other clients until completion); quarantine the orphan
+              // thread ids so their notifications are dropped (not
+              // forwarded to the next client) and best-effort interrupt
               // the orphaned turn so the app-server frees up.
+              const orphanThreadIds = buildStreamThreadIds(message.method, message.params ?? {}, result);
+              for (const tid of orphanThreadIds) {
+                orphanedThreadIds.add(tid);
+              }
               if (result?.turn?.id) {
-                const orphanedThreadIds = buildStreamThreadIds(message.method, message.params ?? {}, result);
-                for (const tid of orphanedThreadIds) {
+                for (const tid of orphanThreadIds) {
                   appClient
                     .request("turn/interrupt", { threadId: tid, turnId: result.turn.id })
                     .catch(() => {});
