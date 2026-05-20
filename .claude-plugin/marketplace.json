@@ -1,19 +1,19 @@
 {
-  "name": "openai-codex",
+  "name": "preference-kim-codex",
   "owner": {
-    "name": "OpenAI"
+    "name": "preference-kim"
   },
   "metadata": {
-    "description": "Codex plugins to use in Claude Code for delegation and code review.",
-    "version": "1.0.4-sunho.2"
+    "description": "Temporary fork of openai/codex-plugin-cc with a per-turn watchdog timeout fix for the Codex Companion hang. Tracks upstream; switch back to openai-codex once the patch lands upstream.",
+    "version": "1.0.5-sunho.0"
   },
   "plugins": [
     {
       "name": "codex",
       "description": "Use Codex from Claude Code to review code or delegate tasks.",
-      "version": "1.0.4-sunho.2",
+      "version": "1.0.5-sunho.0",
       "author": {
-        "name": "OpenAI"
+        "name": "preference-kim"
       },
       "source": "./plugins/codex"
     }

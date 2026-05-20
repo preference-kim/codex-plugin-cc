@@ -1,5 +1,14 @@
 # Codex plugin for Claude Code
 
+> [!IMPORTANT]
+> **Temporary fork.** This is a fork of [`openai/codex-plugin-cc`](https://github.com/openai/codex-plugin-cc)
+> with a single change: a per-turn watchdog timeout in `plugins/codex/scripts/lib/codex.mjs` that
+> bounds the lifetime of a hung `/codex:rescue` turn so the Companion no longer hangs indefinitely
+> when the codex app-server stops emitting notifications mid-turn. The fork is published as
+> marketplace `preference-kim-codex` so it can be installed in parallel with the official
+> `openai-codex` marketplace without shadowing it. Switch back to the official marketplace once
+> the upstream PR lands.
+
 Use Codex from inside Claude Code for code reviews or to delegate tasks to Codex.
 
 This plugin is for Claude Code users who want an easy way to start using Codex from the workflow
@@ -24,13 +33,20 @@ they already have.
 Add the marketplace in Claude Code:
 
 ```bash
-/plugin marketplace add openai/codex-plugin-cc
+/plugin marketplace add preference-kim/codex-plugin-cc
 ```
 
-Install the plugin:
+If the official `codex@openai-codex` plugin is already enabled in your session, disable it first
+to avoid colliding `/codex:*` slash commands:
 
 ```bash
-/plugin install codex@openai-codex
+/plugin disable codex@openai-codex
+```
+
+Install the plugin from this fork:
+
+```bash
+/plugin install codex@preference-kim-codex
 ```
 
 Reload plugins:
