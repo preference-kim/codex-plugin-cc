@@ -1,13 +1,12 @@
 # Codex plugin for Claude Code
 
-> [!IMPORTANT]
-> **Temporary fork.** This is a fork of [`openai/codex-plugin-cc`](https://github.com/openai/codex-plugin-cc)
-> with a single change: a per-turn watchdog timeout in `plugins/codex/scripts/lib/codex.mjs` that
-> bounds the lifetime of a hung `/codex:rescue` turn so the Companion no longer hangs indefinitely
-> when the codex app-server stops emitting notifications mid-turn. The fork is published as
-> marketplace `preference-kim-codex` so it can be installed in parallel with the official
-> `openai-codex` marketplace without shadowing it. Switch back to the official marketplace once
-> the upstream PR lands.
+## About this fork
+
+This is a fork of [`openai/codex-plugin-cc`](https://github.com/openai/codex-plugin-cc) with one change: a per-turn watchdog timeout in `plugins/codex/scripts/lib/codex.mjs` that bounds the lifetime of a hung `/codex:rescue` turn, so the Companion no longer hangs indefinitely when the Codex app-server stops emitting notifications mid-turn.
+
+The fork is published as the `preference-kim-codex` marketplace and installs side by side with the official `openai-codex` marketplace without shadowing it. Switch back to upstream once the PR lands.
+
+---
 
 Use Codex from inside Claude Code for code reviews or to delegate tasks to Codex.
 
@@ -30,34 +29,20 @@ they already have.
 
 ## Install
 
-Add the marketplace in Claude Code:
+In Claude Code, run:
 
 ```bash
+# 1. Add this fork's marketplace
 /plugin marketplace add preference-kim/codex-plugin-cc
-```
 
-If the official `codex@openai-codex` plugin is already enabled in your session, disable it first
-to avoid colliding `/codex:*` slash commands:
-
-```bash
+# 2. If the official plugin is already enabled, disable it to avoid colliding /codex:* commands
 /plugin disable codex@openai-codex
-```
 
-Install the plugin from this fork:
-
-```bash
+# 3. Install from this fork
 /plugin install codex@preference-kim-codex
-```
 
-Reload plugins:
-
-```bash
+# 4. Reload, then verify
 /reload-plugins
-```
-
-Then run:
-
-```bash
 /codex:setup
 ```
 
